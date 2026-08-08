@@ -1,13 +1,20 @@
 package cli;
 
-import picocli.CommandLine;
+import core.PasswordGenerator;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 
+import java.util.Arrays;
 import java.util.concurrent.Callable;
 
-@CommandLine.Command(name = "generate", description = "Generates new strong password")
+@Command(name = "generate",
+        description = "Generates new strong password",
+        mixinStandardHelpOptions = true)
 public class GenerateCommand implements Callable<Integer> {
 
-    @CommandLine.Option(names = {"-l", "--length"}, description = "Length of genereted password")
+    @Option(names = {"-l", "--length"},
+            description = "Length of genereted password",
+            defaultValue = "16")
     private int length;
 
     @Override
@@ -17,7 +24,15 @@ public class GenerateCommand implements Callable<Integer> {
             return 1;
         }
 
-        System.out.println("Generating password of length" + length);
+        PasswordGenerator generator = new PasswordGenerator();
+        char[] newPassword = generator.generatePassword(length);
+        try{
+            System.out.println("Generated password:");
+            System.out.println(newPassword);
+            System.out.println("Password's entropy: " + generator.computeEntropy(length));
+        } finally {
+            Arrays.fill(newPassword, '\0');
+        }
         return 0;
     }
 }
