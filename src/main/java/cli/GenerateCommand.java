@@ -9,18 +9,24 @@ import java.util.concurrent.Callable;
 
 @Command(name = "generate",
         description = "Generates new strong password",
+        version = "1.0",
         mixinStandardHelpOptions = true)
 public class GenerateCommand implements Callable<Integer> {
 
     @Option(names = {"-l", "--length"},
-            description = "Length of genereted password",
+            description = "Length of password to be generated",
             defaultValue = "16")
     private int length;
 
     @Override
-    public Integer call() throws Exception {
-        if(length < 8) {
+    public Integer call() {
+        if(length < 8 ) {
             System.err.println("Error: Password must have length at least 8");
+            return 1;
+        }
+
+        if(length > 256) {
+            System.err.println("Error: Password must have length at most 256");
             return 1;
         }
 

@@ -25,6 +25,6 @@ public class PassMgrApp implements Callable<Integer> {
     @Override
     public Integer call() {
         spec.commandLine().usage(System.out);
-        return 0;
+        return CommandLine.ExitCode.USAGE;
     }
 }
