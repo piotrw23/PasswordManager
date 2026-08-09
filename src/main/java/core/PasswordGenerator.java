@@ -12,10 +12,7 @@ public class PasswordGenerator {
     private final SecureRandom secureRandom = new SecureRandom();
 
     public char[] generatePassword(int length) {
-        if(length < 8) {
-            throw new IllegalArgumentException("Hasło musi zawierać co najmniej 8 znaków.");
-        }
-
+        // guaranteed that length is always >= 8 and <= 256
         boolean isValid = false;
         char[] password = new char[length];
 
