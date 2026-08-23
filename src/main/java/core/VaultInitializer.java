@@ -11,16 +11,22 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Creates a new vault: the database, its schema and the metadata needed to open it again.
@@ -38,7 +44,14 @@ import java.util.List;
  *   <li>encrypt the canary, so a wrong password can be reported instead of surfacing as
  *       corrupt-looking output later
  *   <li>create the database and write every metadata row in one transaction
+ *   <li>claim the real path, which at most one run can do
  * </ol>
+ *
+ * <p><strong>Two runs at once:</strong> the vault is built under a name no other run can be using
+ * and only then claimed at its real path, by a filesystem operation that fails when something is
+ * already there. Two {@code init} runs started at the same moment therefore end with one vault and
+ * one refusal, whichever order they happen to run in. The check at the top of {@link #initialize}
+ * is only there to fail early and cheaply; it is the claim that decides.
  *
  * <p><strong>Why a DEK at all:</strong> entries are encrypted under the DEK, not under the key
  * derived from the password. Changing the master password then only rewraps the DEK, instead of
@@ -79,8 +92,28 @@ public final class VaultInitializer {
 
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
-    /** Suffix of the file a vault is built under before it is moved into place. */
-    private static final String TEMPORARY_SUFFIX = ".tmp";
+    /**
+     * A vault is built under {@code vault-<random>.db.tmp} and claimed at its real path afterwards.
+     * The name is unique per run: two runs sharing one would overwrite each other's database as
+     * they built it, and the one that finished second could be claimed while still half written.
+     *
+     * <p>Kept package-private, like the glob below, so tests can put a leftover where a run that
+     * died would have left one.
+     */
+    static final String TEMPORARY_PREFIX = "vault-";
+
+    static final String TEMPORARY_SUFFIX = ".db.tmp";
+
+    /** Matches every name {@link #createTemporaryFile} can produce, side files included. */
+    static final String TEMPORARY_GLOB = TEMPORARY_PREFIX + "*" + TEMPORARY_SUFFIX + "*";
+
+    /**
+     * A half-built vault is still a vault: it holds the wrapped DEK and the salt, so it must be no
+     * more readable than the finished one. The permissions are passed to
+     * {@link Files#createTempFile} as an attribute, so the file is never briefly readable by others.
+     */
+    private static final FileAttribute<Set<PosixFilePermission>> OWNER_ONLY_FILE =
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"));
 
     /**
      * A SQLite database is up to three files. Cleaning up after a failed run has to remove all of
@@ -110,19 +143,26 @@ public final class VaultInitializer {
     /**
      * Creates a vault at {@link VaultPaths#databaseFile()} protected by {@code masterPassword}.
      *
-     * <p>The vault is built under a temporary file and moved into place only once it is complete,
-     * so an interrupted run never leaves something at the real path that the next run would mistake
-     * for an existing vault.
+     * <p>The vault is built under a temporary file and claimed at the real path only once it is
+     * complete, so an interrupted run never leaves something at the real path that the next run
+     * would mistake for an existing vault.
      *
      * @param masterPassword read but not cleared; the caller owns it
-     * @throws IllegalStateException if a vault already exists
+     * @throws IllegalStateException if a vault already exists, including one that appeared while
+     *                               this run was building its own
      */
     public void initialize(char[] masterPassword) throws IOException, SQLException, GeneralSecurityException {
-        // checked before the directory is touched, so refusing leaves the filesystem as it was
+        // checked before the directory is touched, so refusing leaves the filesystem as it was.
+        // Only an early exit: a vault created from here on is caught by the claim at the end, which
+        // is what actually keeps two runs from overwriting each other
         if (paths.vaultExists()) {
-            throw new IllegalStateException("A vault already exists at " + paths.databaseFile());
+            throw new IllegalStateException(alreadyExistsMessage(paths.databaseFile()));
         }
         paths.ensureVaultDirectory();
+
+        // before the expensive part, and while this run still has no file of its own to confuse
+        // with someone else's
+        deleteStaleTemporaryFiles();
 
         // the salt is not a secret and is stored in the clear next to the vault; what it buys is
         // that two vaults with the same password derive different keys, so one cracked password
@@ -148,11 +188,7 @@ public final class VaultInitializer {
         EncryptedData canary = CryptoService.encrypt(dek, CANARY_PLAINTEXT.getBytes(StandardCharsets.UTF_8));
 
         Path target = paths.databaseFile();
-        Path temporary = target.resolveSibling(target.getFileName() + TEMPORARY_SUFFIX);
-
-        // a run that died before the move leaves this behind; opening a stale database would fail
-        // further in with "table already exists", which says nothing about what actually happened
-        deleteDatabaseFiles(temporary);
+        Path temporary = createTemporaryFile();
 
         try {
             try (VaultDatabase vault = VaultDatabase.open(temporary)) {
@@ -166,12 +202,89 @@ public final class VaultInitializer {
             }
 
             // the vault is closed by now, so its WAL has been checkpointed into the file being
-            // moved; ATOMIC_MOVE then puts a complete vault at the target path in one step
-            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE);
+            // claimed, and what appears at the target path is a complete vault
+            claim(target, temporary);
         } catch (IOException | SQLException | RuntimeException e) {
             deleteQuietly(temporary, e);
             throw e;
         }
+
+        // both names refer to the finished vault; the temporary one has served its purpose. A
+        // failure here would leave the vault in place, so reporting one would be a lie — and the
+        // leftover is swept up by the next run
+        deleteQuietly(temporary);
+    }
+
+    /**
+     * Puts the finished vault at its real path, atomically, and only when nothing is there.
+     *
+     * <p>A hard link rather than a move: {@link Files#move} replaces whatever it finds, so of two
+     * runs racing each other both would report success and the loser's vault would be gone without
+     * a word — including every secret in it, if the loser was the older vault. Linking fails when
+     * the target exists, and the filesystem decides that for the whole operation, so at most one
+     * run can win no matter how the two interleave.
+     *
+     * <p>Afterwards both names refer to one file; the caller removes the temporary one.
+     *
+     * <p>Kept package-private so tests can exercise both outcomes of the race directly, rather than
+     * by starting threads and hoping they interleave the interesting way.
+     *
+     * @throws IllegalStateException if a vault is already at {@code target}
+     * @throws IOException           if something that is not a vault is in the way, or the link
+     *                               cannot be created
+     */
+    static void claim(Path target, Path temporary) throws IOException {
+        try {
+            Files.createLink(target, temporary);
+        } catch (FileAlreadyExistsException e) {
+            // the path is taken either way and this run has lost; the second look only decides the
+            // wording, so a further change underneath it costs nothing
+            if (Files.isRegularFile(target)) {
+                throw new IllegalStateException(alreadyExistsMessage(target), e);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Creates the file the vault is built under, with a name no other run can be using.
+     *
+     * <p>{@link Files#createTempFile} both draws the name and creates the file in one step, so two
+     * runs cannot come away with the same one. An empty file is a valid empty database, which is
+     * what lets the name be claimed by creating it rather than by hoping it is free.
+     */
+    private Path createTemporaryFile() throws IOException {
+        return Files.createTempFile(paths.vaultHome(), TEMPORARY_PREFIX, TEMPORARY_SUFFIX, OWNER_ONLY_FILE);
+    }
+
+    /**
+     * Removes what runs that died before claiming their vault left behind.
+     *
+     * <p>Names are unique per run, so nothing else would ever collect these, and each holds a
+     * wrapped DEK the user's password unwraps — the same thing worth stealing as the vault itself.
+     *
+     * <p>Runs before this run creates a file of its own, so it never sweeps away its own work.
+     *
+     * <p>Deleting one that a run started moments ago is still building costs that run its file and
+     * makes it fail when it goes to claim it. It cannot produce a damaged vault: the name it links
+     * from is one no other run can recreate, so the link either finds the file this run built or
+     * finds nothing at all. That window is only as long as it takes to write the database — the
+     * key derivation, which is the slow part, happens before the file exists.
+     */
+    private void deleteStaleTemporaryFiles() throws IOException {
+        List<Path> leftovers = new ArrayList<>();
+        try (DirectoryStream<Path> entries =
+                     Files.newDirectoryStream(paths.vaultHome(), TEMPORARY_GLOB)) {
+            entries.forEach(leftovers::add);
+        }
+
+        for (Path leftover : leftovers) {
+            Files.deleteIfExists(leftover);
+        }
+    }
+
+    private static String alreadyExistsMessage(Path databaseFile) {
+        return "A vault already exists at " + databaseFile;
     }
 
     /**
@@ -242,8 +355,7 @@ public final class VaultInitializer {
     /**
      * Removes a database and the side files SQLite keeps beside it.
      *
-     * <p>Used before building a vault, where a leftover from an interrupted run has to go, and
-     * again when that build fails.
+     * <p>Used to remove the file a run built under, whether that run failed or succeeded.
      */
     private static void deleteDatabaseFiles(Path database) throws IOException {
         for (String suffix : DATABASE_FILE_SUFFIXES) {
@@ -261,6 +373,18 @@ public final class VaultInitializer {
             deleteDatabaseFiles(database);
         } catch (IOException cleanupFailure) {
             primary.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /**
+     * Cleans up after a run that succeeded. There is no failure to report against here: the vault
+     * exists, so the run did what it was asked. A leftover is collected by the next run.
+     */
+    private static void deleteQuietly(Path database) {
+        try {
+            deleteDatabaseFiles(database);
+        } catch (IOException ignored) {
+            // deliberately ignored; see above
         }
     }
 }
